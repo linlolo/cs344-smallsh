@@ -11,36 +11,64 @@
 # include <signal.h>
 # include <unistd.h>
 
-struct pidList {
+// declare global variable for foreground only
+bool foreground_only = false;
+int status = 0;
+
+struct pidNode {
 	pid_t pid;
-	struct pidList* next;
+	struct pidNode* next;
 };
 
-void handle_SIGINT(int signo) {
-	char* message = "Caught SIGINT, sleeping for 10 seconds\n";
-	write(STDOUT_FILENO, message, 39);
-	// Raise SIGUSR2. However, since this signal is blocked until handle_SIGNIT
-	// finishes, it will be delivered only when handle_SIGINT finishes
-	raise(SIGUSR2);
-	// Sleep for 10 seconds
-	sleep(10);
+struct pidNode* head = NULL;
+struct pidNode* cur = NULL;
+
+void handle_SIGCHLD(int signo) {
+	int exitStatus;
+	pid_t process = wait( &exitStatus );
+	char message[60];
+	if (process == -1) {
+		return;
+	}
+	else if (WIFEXITED(exitStatus)) {
+		sprintf(message, "\nbackground pid %d is done: exit value %d\n", process, WEXITSTATUS(exitStatus));
+		write(STDOUT_FILENO, message, strlen(message) + 1);
+		fflush(stdout);
+	}
+	else {
+		sprintf(message, "background pid %d is done: terminated by signal %d\n", process, signo);
+		write(STDOUT_FILENO, message, strlen(message) + 1);
+		fflush(stdout);
+	}
 }
 
-void undo_SIGTSTP(int signo) {
+void handle_SIGTERM(int signo) {
+	char message[60];
+	sprintf(message, "background pid %d is done : terminated by signal 15", getpid());
+	write(STDOUT_FILENO, message, strlen(message) + 1);
+	fflush(stdout);
+}
 
+void handle_SIGINT(int signo) {
+	char message[23] = "terminated by signal 2";
+	write(STDOUT_FILENO, message, strlen(message) + 1);
+	fflush(stdout);
+	exit(1);
 }
 
 void handle_SIGTSTP(int signo) {
-	char* message = "Entering foreground-only mode (& is now ignored)\n";
-	write(STDOUT_FILENO, message, 50);
-
-}
-
-// Handler for SIGUSR2
-void handle_SIGUSR2(int signo) {
-	char* message = "Caught SIGUSR2, exiting!\n";
-	write(STDOUT_FILENO, message, 25);
-	exit(0);
+	if (foreground_only) {
+		char* message = "\nExiting foreground-only mode\n";
+		write(STDOUT_FILENO, message, strlen(message) +1 );
+		fflush(stdout);
+		foreground_only = false;
+	}
+	else {
+		char* message = "\nEntering foreground-only mode (& is now ignored)\n";
+		write(STDOUT_FILENO, message, strlen(message) + 1);
+		fflush(stdout);
+		foreground_only = true;
+	}
 }
 
 char* pid_to_string(pid_t num) {
@@ -70,54 +98,84 @@ char* string_expansion(char* str1, char* pid) {
 	return temp_string;
 }
 
-bool check_builtin(char* arg, char* input, int exitStatus) {
+bool check_builtin(char** arguments, int exitStatus) {
 	// if command is kill, exit shell
-	if (strcmp(arg, "exit") == 0) {
+	if (strcmp(arguments[0], "exit") == 0) {
 		exit(0);
 	}
 	// if command is cd, change directory
-	else if (strcmp(arg, "cd") == 0) {
-		char* inputPtr;
-		char* token = strtok_r(input, " \n", &inputPtr);
-		token = strtok_r(NULL, " \n", &inputPtr);
-		if (token == NULL) {
+	else if (strcmp(arguments[0], "cd") == 0) {
+		if (arguments[1] == '\0') {
 			chdir(getenv("HOME"));
 		}
 		else {
-			chdir(token);
+			chdir(arguments[1]);
 		}
 		return true;
 	}
 	// if command is status, print status
-	else if (strcmp(arg, "status") == 0) {
-		printf("exit value %d\n", exitStatus);
+	else if (strcmp(arguments[0], "status") == 0) {
+		printf("exit value %d\n", status);
 		fflush(stdout);
 		return true;
 	}
 	return false;
 }
 
-bool execute_command(char** arguments, char** arg_in, char** arg_out, char* input, char* curpid, int exitStatus) {
-	char* token;
-	char* inputPtr;
-	int left = 0;
-	int index = 0;
-	bool foreground;
+int main(int argc, char* argv[]) {
+	int index = 0;				// used to delimit input
+	int sourceFD;
+	int targetFD;
+	char input[2049];			// used to take in input
+	char* arguments[512];		// used to split input into array
+	char* token;				// strtok token
+	char* inputPtr;				// used for strtok Ptr
+	
+	char* cur_path[PATH_MAX];	// used to store current working directory
+	char* curpid = pid_to_string(getpid());
 
-	fgets(input, 2048, stdin);
-	// check special inputs
-	// check for no input or input that begins with "#"
-	if (strcmp(input, "\n") == 0 || input[0] == '#') {
-		return false;
-	}
-	else {
-		// delimit input into an array of strings and check for $$ expansion
-		token = strtok_r(input, " \n", &inputPtr);
-		if (check_builtin(token, input, exitStatus)) {
-			return false;
+	struct sigaction SIGTSTP_action = { 0 }, SIGTERM_action = { 0 }, ignore_action = { 0 }, default_action = { 0 }, SIGINT_action = { 0 }, SIGCHLD_action = { 0 };
+	struct pidNode* head = NULL;
+	struct pidNode* cur = NULL;
+
+	// Block all catchable signals while handle_SIGTSTP is running
+	SIGTSTP_action.sa_handler = handle_SIGTSTP;
+	sigfillset(&SIGTSTP_action.sa_mask);
+	// SIGTSTP to restart function on interrupt
+	SIGTSTP_action.sa_flags = SA_RESTART;
+	sigaction(SIGTSTP, &SIGTSTP_action, NULL);
+	
+	// The ignore_action struct as SIG_IGN as its signal handler
+	ignore_action.sa_handler = SIG_IGN;
+	
+	// Register the ignore_action as the handler for SIGINT
+	sigaction(SIGINT, &ignore_action, NULL);
+	sigaction(SIGTERM, &ignore_action, NULL);
+
+	while (true) {
+		int exitStatus;
+		int cleanupStatus;
+		bool foreground = true;		// used to check if command is executed in foreground
+		index = 0;
+		pid_t cleanup = waitpid(-1, &cleanupStatus, WNOHANG);
+		if (cleanup > 0) {
+			printf("Background process %d is done: Exit value %d\n", cleanup, cleanupStatus);
+		}
+		printf(": ");
+		fflush(stdout);
+		fgets(input, 2048, stdin);
+		// check special inputs
+		// check for no input or input that begins with "#"
+		if (strcmp(input, "\n") == 0 || input[0] == '#') {
+			continue;
 		}
 		else {
+			// delimit input into an array of strings and check for $$ expansion
+			// first argument is built in command
+			token = strtok_r(input, " \n", &inputPtr);
+			// delimit input string by space and new line
 			while (token != NULL) {
+				// check if any argument has $$ and expand when appropraite
 				char* temp_string = string_expansion(token, curpid);
 				arguments[index] = calloc(strlen(temp_string) + 1, sizeof(char));
 				strcpy(arguments[index], temp_string);
@@ -125,155 +183,118 @@ bool execute_command(char** arguments, char** arg_in, char** arg_out, char* inpu
 				index++;
 				token = strtok_r(NULL, " \n", &inputPtr);
 			}
-			foreground = false;
 			arguments[index] = NULL;
-			printf("arg1 is %s arg2 is %s\n", arguments[0], arguments[1]);
-			fflush(stdout);
-			pid_t process = fork();
-			switch (process) {
-			case -1:
-				// error with fork()
-				perror("fork() failed\n");
-				exit(1);
-				break;
-			case 0:
-				// execute command as child process, return 1 as exit status if exec fails
-				for (int i = 0; arguments[i]; i++) {
-					if (strcmp(arguments[i], "<") == 0) {
-						int sourceFD = open(arguments[i+1], O_RDONLY);
-						if (sourceFD == -1) {
-							perror("source open()");
-							exit(1);
-						}
-						int result = dup2(sourceFD, 0);
-						if (result == -1) {
-							perror("source dup2()");
-							exit(2);
-						}
-						fcntl(sourceFD, F_SETFD, FD_CLOEXEC);
-						arguments[i] = NULL;
-					}
-					else if (strcmp(arguments[i], ">") == 0) {
-						int targetFD = open(arguments[i+1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
-						if (targetFD == -1) {
-							perror("source open()");
-							exit(1);
-						}
-						int result = dup2(targetFD, 1);
-						if (result == -1) {
-							perror("source dup2()");
-							exit(2);
-						}
-						fcntl(targetFD, F_SETFD, FD_CLOEXEC);
-						arguments[i] = NULL;
-					}
+				
+			if (check_builtin(arguments, status)) { }
+			else {
+				// last argument is &, so process will be run in background, and don't include argument
+				if (strcmp(arguments[index - 1], "&") == 0) {
+					foreground = false;
+					arguments[index - 1] = NULL;
 				}
-				execvp(arguments[0], arguments);
-				perror(execvp);
-				exit(1);
-				break;
-			default:
-				// wait for child process if command to be ran as foreground process
-				if (foreground) {
-					pid_t processPid = waitpid(process, &exitStatus, 0);
+				
+				// SIGTSTP signal for foreground only mode is on
+				if (foreground_only) foreground = true;
+				
+				// fork child process to execute command
+				pid_t process = fork();
+				switch (process) {
+				case -1:
+					// error with fork()
+					perror("fork() failed\n");
+					exit(1);
+					break;
+				case 0:
+					// background processes ignores SIGTSTP
+					ignore_action.sa_handler = SIG_IGN;
+					sigaction(SIGTSTP, &ignore_action, NULL);
+
+					// execute command as child process, return 1 as exit status if exec fails
+					for (int i = 0; arguments[i]; i++) {
+						// redirect input sign, so open read only file. exit error 1 if not available
+						if (strcmp(arguments[i], "<") == 0) {
+							if (foreground) {
+								sourceFD = open(arguments[i + 1], O_RDONLY);
+							}
+							else {
+								sourceFD = open("/dev/null", O_RDONLY);
+							}
+							if (sourceFD == -1) {
+								perror("error opening read only file");
+								exit(1);
+							}
+							// use dup2 to redirect stdin to file
+							int result = dup2(sourceFD, 0);
+							if (result == -1) {
+								perror("source dup2()");
+								exit(1);
+							}
+							fcntl(sourceFD, F_SETFD, FD_CLOEXEC);
+							arguments[i] = NULL;
+						}
+						// redirect output sign, so open write only file. exit error 1 if not available
+						else if (strcmp(arguments[i], ">") == 0) {
+							if (foreground) {
+								targetFD = open(arguments[i + 1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+							}
+							else {
+								targetFD = open("/dev/null", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+							}
+							if (targetFD == -1) {
+								perror("error opening write only file");
+								exit(1);
+							}
+							// use dup2 to redirect stdout to file
+							int result = dup2(targetFD, 1);
+							if (result == -1) {
+								perror("source dup2()");
+								exit(1);
+							}
+							fcntl(targetFD, F_SETFD, FD_CLOEXEC);
+							arguments[i] = NULL;
+						}
+					}
+					if (foreground) {
+						// reset SIGINT to default action if run in foreground
+						SIGINT_action.sa_handler = handle_SIGINT;
+						sigfillset(&SIGINT_action.sa_mask);
+						SIGINT_action.sa_flags = 0;
+						sigaction(SIGINT, &SIGINT_action, NULL);
+					}
+					execvp(arguments[0], arguments);
+					perror(execvp);
+					exit(1);
+					break;
+				default:
+					// wait for child process if command to be ran as foreground process
+					fcntl(sourceFD, F_SETFD, FD_CLOEXEC);
+					fcntl(targetFD, F_SETFD, FD_CLOEXEC);
+
+					if (foreground) {
+						printf("this is a foreground process\n");
+						fflush(stdout);
+						pid_t processPid = waitpid(process, &exitStatus, 0);
+						}
+					else {
+						/*
+						SIGCHLD_action.sa_handler = handle_SIGCHLD;
+						sigfillset(&SIGCHLD_action.sa_mask);
+						SIGCHLD_action.sa_flags = SA_RESTART;
+						sigaction(SIGCHLD, &SIGCHLD_action, NULL);
+						pid_t processPid = waitpid(process, &exitStatus, WNOHANG);
+						*/
+						printf("background pid is %d\n", process);
+						fflush(stdout);
+					}
+					break;
 				}
-				break;
+				// free up space for input and argument array
 			}
-			// free up space for input and argument array
-			memset(input, 0, sizeof(input));
 			for (int i = 0; arguments[i]; i++) {
 				free(arguments[i]);
 			}
+			memset(input, 0, sizeof(input));
 		}
 	}
-	return true;
-}
-
-int find_arr_len(char* arguments[]) {
-	int i = 0;
-	while (i < 512) {
-		if (arguments[i] == 0) {
-			break;
-		}
-		else {
-			i++;
-		}
-	}
-	return i-1;
-}
-
-void copy_array(char** source, char** dest) {
-	for (int i = 0; source[i]; i++) {
-		strcpy(dest[i], source[i]);
-	}
-}
-
-void execute_process(char** arg1, char** arg2, bool foreground) {
-
-}
-
-int main(int argc, char* argv[]) {
-	int exitStatus;				// used to keep track of exit status
-	int index;					// used to delimit input
-	char input[2049];			// used to take in input
-	char* arguments[512];		// used to split input into array
-	char* arg_in[512];			// argument array for input
-	char* arg_out[512];			// argument array for output
-	char* token;				// strtok token
-	char* inputPtr;				// used for strtok Ptr
-	char* cur_path[PATH_MAX];	// used to store current working directory
-	bool foreground;			// used to check if command is executed in foreground
-	char* curpid = pid_to_string(getpid());
-
-	int count = 0;
-
-	/*
-	// copied from exploration
-	struct sigaction SIGINT_action = { 0 }, SIGTSTP_action = {0}, SIGUSR2_action = { 0 }, ignore_action = { 0 };
-
-	// Fill out the SIGINT_action struct
-	// Register handle_SIGINT as the signal handler
-	SIGINT_action.sa_handler = handle_SIGINT;
-	// Block all catchable signals while handle_SIGINT is running
-	sigfillset(&SIGINT_action.sa_mask);
-	// No flags set
-	SIGINT_action.sa_flags = 0;
-	sigaction(SIGINT, &SIGINT_action, NULL);
-
-	// Fill out the SIGUSR2_action struct
-	// Register handle_SIGUSR2 as the signal handler
-	SIGUSR2_action.sa_handler = handle_SIGUSR2;
-	// Block all catchable signals while handle_SIGUSR2 is running
-	sigfillset(&SIGUSR2_action.sa_mask);
-	// No flags set
-	SIGUSR2_action.sa_flags = 0;
-	sigaction(SIGUSR2, &SIGUSR2_action, NULL);
-
-	// The ignore_action struct as SIG_IGN as its signal handler
-	ignore_action.sa_handler = SIG_IGN;
-
-	// Register the ignore_action as the handler for SIGTERM, SIGHUP, SIGQUIT.
-	// So all three of these signals will be ignored.
-	sigaction(SIGTERM, &ignore_action, NULL);
-	sigaction(SIGHUP, &ignore_action, NULL);
-	sigaction(SIGQUIT, &ignore_action, NULL);
-
-	struct pidList* head = NULL;		// instantiate linked list to store background process PIDs
-
-	getcwd(cur_path, sizeof(cur_path));
-	chdir(getenv("HOME"));
-	chdir("vsprojects");
-	*/
-
-	while (count < 10) {
-		foreground = true;
-		printf(": ");
-		fflush(stdout);
-		execute_command(arguments, arg_in, arg_out, input, curpid, exitStatus);
-		printf("should have returned true\n");
-		
-		// free up space for input and argument array
-		count++;
-		}
 	return EXIT_SUCCESS;
 }
